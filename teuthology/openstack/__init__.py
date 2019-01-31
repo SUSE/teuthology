@@ -113,8 +113,16 @@ class OpenStackInstance(object):
         Return the uuid of the volumes attached to the name_or_id
         OpenStack instance.
         """
-        volumes = self['os-extended-volumes:volumes_attached']
-        return [volume['id'] for volume in volumes ]
+        if 'os-extended-volumes:volumes_attached' in self.info:
+            volumes = self['os-extended-volumes:volumes_attached']
+            return [volume['id'] for volume in volumes ]
+        # openstack-client 3.19
+        elif 'volumes_attached' in self.info:
+            volumes = self['volumes_attached']
+            if volumes:
+                volumes = [v.split("=")[1] for v in volumes.split("\n")]
+                return [v.strip("'\"") for v in volumes]
+        return []
 
     def get_addresses(self):
         """
@@ -127,6 +135,42 @@ class OpenStackInstance(object):
                 if found:
                     return self['addresses']
                 self.set_info()
+
+    @staticmethod
+    def parse_openstack(data):
+        """
+        Parse OpenStack structures, like multiline data:
+           a='10', b='11', c='13'
+           a='20', b='21', c='23'
+        """
+        values=[{a:b.strip("'") for a,b in
+                    [p.split("=") for p in pairs.split(", ")]}
+                                    for pairs in data.split("\n")]
+        return values
+
+    def get_ip_openstack(self):
+        subnets = json.loads(misc.sh("openstack subnet list -f json --ip-version 4"))
+        subnet_ids = [i['ID'] for i in subnets]
+
+        if not subnet_ids:
+            raise Exception("no subnet with ip_version == 4")
+
+        ports = json.loads(misc.sh("openstack port list -f json -c fixed_ips -c device_id"))
+        fixed_ips = None
+        for port in ports:
+            if port['device_id'] == self['id']:
+                fixed_ips = self.parse_openstack(port['Fixed IP Addresses'])
+                break
+        if not fixed_ips:
+            raise Exception("no fixed ip record found")
+        ip = None
+        for record in fixed_ips:
+            if record['subnet_id'] in subnet_ids:
+                ip = record['ip_address']
+                break
+        if not ip:
+            raise Exception("no ip")
+        return ip
 
     def get_ip_neutron(self):
         subnets = json.loads(misc.sh("neutron subnet-list -f json -c id -c ip_version"))
@@ -160,7 +204,8 @@ class OpenStackInstance(object):
         """
         if self.private_ip is None:
             try:
-                self.private_ip = self.get_ip_neutron()
+                #self.private_ip = self.get_ip_neutron()
+                self.private_ip = self.get_ip_openstack()
             except Exception as e:
                 log.debug("ignoring get_ip_neutron exception " + str(e))
                 self.private_ip = re.findall(network + '=([\d.]+)',
@@ -232,6 +277,9 @@ class OpenStack(object):
     token = None
     token_expires = None
     token_cache_duration = 3600
+    versions = None
+    os_env = None
+    os_ver = None
 
     def cache_token(self):
         if self.get_provider() != 'ovh':
@@ -261,21 +309,56 @@ class OpenStack(object):
         if self.get_provider() != 'ovh':
             return ""
         url = ""
+        if not self.os_ver:
+            (name, ver) = misc.sh('openstack --version').split(' ')
+            self.os_ver = tuple(int(i) for i in ver.strip().split('.'))
+            log.debug("openstack ver: %s" % list(self.os_ver))
+        if not self.versions and self.os_ver > (3,16):
+            versions_json = misc.sh('openstack versions show --region-name {} -f json'
+                                    .format(os.environ['OS_REGION_NAME']))
+            versions_list = json.loads(versions_json)
+            current_versions = [(i["Service Type"], i["Endpoint"], i["Version"])
+                             for i in versions_list if i["Status"] == "CURRENT"]
+            log.debug("Current versions: %s" % current_versions)
+            self.versions = dict()
+            for x in [i for i in versions_list if i["Status"] == "CURRENT"]:
+                if x["Service Type"] not in self.versions:
+                    self.versions[x["Service Type"]] = x["Endpoint"]
+            log.debug("Endpoint %s" % self.versions)
+            self.os_env = {k: v for (k,v) in os.environ.items() if k.startswith('OS_') }
+
+        api = ''
         if (type == 'compute' or
+            cmd.startswith("keypair ") or
             cmd.startswith("server ") or
             cmd.startswith("flavor ")):
-            url = "https://compute.{reg}.cloud.ovh.net/v2/{tenant}"
+            api = 'compute'
         elif (type == 'network' or
               cmd.startswith("ip ") or
               cmd.startswith("security ") or
               cmd.startswith("network ")):
-            url = "https://network.compute.{reg}.cloud.ovh.net/"
+            api = 'network'
         elif (type == 'image' or
               cmd.startswith("image ")):
-            url = "https://image.compute.{reg}.cloud.ovh.net/"
+            api = 'image'
         elif (type == 'volume' or
               cmd.startswith("volume ")):
-            url = "https://volume.compute.{reg}.cloud.ovh.net/v2/{tenant}"
+            api = 'volume'
+
+        if self.os_ver > (3,16):
+            if api and api in self.versions:
+                url = self.versions[api]
+            return url
+
+        api_url = dict(
+            compute="https://compute.{reg}.cloud.ovh.net/v2/{tenant}",
+            network="https://network.compute.{reg}.cloud.ovh.net/",
+            image="https://image.compute.{reg}.cloud.ovh.net/",
+            volume="https://volume.compute.{reg}.cloud.ovh.net/v2/{tenant}",
+            )
+
+        if api and api in api_url:
+           url = api_url[api]
         if url != "":
             url = url.format(reg=os.environ['OS_REGION_NAME'],
                              tenant=os.environ['OS_TENANT_ID'])
@@ -285,17 +368,24 @@ class OpenStack(object):
         url = self.get_os_url(cmd, kwargs.get('type'))
         if url != "":
             if self.cache_token():
-                os.environ['OS_TOKEN'] = os.environ['OS_TOKEN_VALUE']
+                if self.os_ver > (3, 16):
+                    for k in self.os_env.keys():
+                        del os.environ[k]
+                os.environ['OS_TOKEN'] = self.token
                 os.environ['OS_URL'] = url
-        if re.match('(server|flavor|ip|security|network|image|volume|keypair)', cmd):
+        if re.match('(server|flavor|floating|ip|security|network|image|volume|keypair)', cmd):
             cmd = "openstack --quiet " + cmd
         try:
+            log.debug("URL=%s" % url)
             status = misc.sh(cmd)
         finally:
             if 'OS_TOKEN' in os.environ:
                 del os.environ['OS_TOKEN']
             if 'OS_URL' in os.environ:
                 del os.environ['OS_URL']
+            if self.os_ver > (3, 16):
+                for k, v in self.os_env.items():
+                    os.environ[k] = v
         return status
     
     def set_provider(self):
@@ -1263,7 +1353,7 @@ openstack security group rule create --protocol udp --src-group {server} --dst-p
         pool = pools[0]['Name']
         try:
             ip = json.loads(OpenStack().run(
-                "ip floating create -f json '" + pool + "'"))
+                "floating ip create -f json '" + pool + "'"))
             return ip['ip']
         except subprocess.CalledProcessError:
             log.debug("create_floating_ip: not creating a floating ip")
@@ -1279,12 +1369,12 @@ openstack security group rule create --protocol udp --src-group {server} --dst-p
         if not ip:
             ip = TeuthologyOpenStack.create_floating_ip()
         if ip:
-            OpenStack().run("ip floating add " + ip + " " + name_or_id)
+            OpenStack().run("server add floating ip %s %s" % (name_or_id, ip))
 
     @staticmethod
     def get_os_floating_ips():
         try:
-            ips = json.loads(OpenStack().run("ip floating list -f json"))
+            ips = json.loads(OpenStack().run("floating ip list -f json"))
         except subprocess.CalledProcessError as e:
             log.warning(e)
             if e.returncode == 1:
@@ -1322,9 +1412,9 @@ openstack security group rule create --protocol udp --src-group {server} --dst-p
         ip = OpenStackInstance(instance_id).get_floating_ip()
         if not ip:
             return
-        OpenStack().run("ip floating remove " + ip + " " + instance_id)
+        OpenStack().run("server remove floating ip %s %s" % (instance_id, ip))
         ip_id = TeuthologyOpenStack.get_floating_ip_id(ip)
-        OpenStack().run("ip floating delete " + ip_id)
+        OpenStack().run("floating ip delete " + ip_id)
 
     def create_cluster(self):
         user_data = self.get_user_data()
